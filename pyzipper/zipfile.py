@@ -1711,6 +1711,7 @@ class ZipFile:
         self.encryption_kwargs = None
         self._comment = b''
         self._strict_timestamps = strict_timestamps
+        self.careful = False
 
         # Check if we were passed a file-like object
         # os.PathLike and os.fspath were added in python 3.6
@@ -1765,6 +1766,7 @@ class ZipFile:
                     except (AttributeError, OSError):
                         self._seekable = False
             elif mode == 'a':
+                self.careful = True
                 try:
                     # See if file is a zip file
                     self._RealGetContents()
@@ -2194,8 +2196,9 @@ class ZipFile:
 
     def write(self, filename, arcname=None,
               compress_type=None, compresslevel=None, encrypt=True):
-        """Put the bytes from filename into the archive under the name
-        arcname."""
+      """Put the bytes from filename into the archive under the name
+      arcname."""
+      with self._lock:
         if not self.fp:
             raise ValueError(
                 "Attempt to write to ZIP archive that was already closed")
@@ -2221,7 +2224,8 @@ class ZipFile:
             else:
                 zinfo._compresslevel = self.compresslevel
 
-        if zinfo.is_dir():
+        try:
+          if zinfo.is_dir():
             with self._lock:
                 if self._seekable:
                     self.fp.seek(self.start_dir)
@@ -2237,17 +2241,23 @@ class ZipFile:
                 self.NameToInfo[zinfo.filename] = zinfo
                 self.fp.write(zinfo.FileHeader(False))
                 self.start_dir = self.fp.tell()
-        else:
+          else:
             with open(filename, "rb") as src, self.open(zinfo, 'w', encrypt=encrypt) as dest:
                 shutil.copyfileobj(src, dest, 1024*8)
+        finally:
+            if self._seekable and self.careful:
+                self.fp.seek(self.start_dir)
+                self._write_end_record()
+                self.fp.seek(self.start_dir)
 
     def writestr(self, zinfo_or_arcname, data,
                  compress_type=None, compresslevel=None, encrypt=True):
-        """Write a file into the archive.  The contents is 'data', which
-        may be either a 'str' or a 'bytes' instance; if it is a 'str',
-        it is encoded as UTF-8 first.
-        'zinfo_or_arcname' is either a ZipInfo instance or
-        the name of the file in the archive."""
+      """Write a file into the archive.  The contents is 'data', which
+      may be either a 'str' or a 'bytes' instance; if it is a 'str',
+      it is encoded as UTF-8 first.
+      'zinfo_or_arcname' is either a ZipInfo instance or
+      the name of the file in the archive."""
+      with self._lock:
         if isinstance(data, str):
             data = data.encode("utf-8")
         if not isinstance(zinfo_or_arcname, self.zipinfo_cls):
@@ -2279,9 +2289,14 @@ class ZipFile:
             zinfo._compresslevel = compresslevel
 
         zinfo.file_size = len(data)            # Uncompressed size
-        with self._lock:
+        try:
             with self.open(zinfo, mode='w', encrypt=encrypt) as dest:
                 dest.write(data)
+        finally:
+            if self._seekable and self.careful:
+                self.fp.seek(self.start_dir)
+                self._write_end_record()
+                self.fp.seek(self.start_dir)
 
     def __del__(self):
         """Call the "close()" method in case the user forgot."""
@@ -2301,9 +2316,12 @@ class ZipFile:
         try:
             if self.mode in ('w', 'x', 'a') and self._didModify:  # write ending records
                 with self._lock:
+                  try:
                     if self._seekable:
                         self.fp.seek(self.start_dir)
                     self._write_end_record()
+                  except ValueError:
+                    pass
         finally:
             fp = self.fp
             self.fp = None
